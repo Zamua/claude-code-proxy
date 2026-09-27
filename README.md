@@ -2,6 +2,8 @@
 > for successful silent completion after tool results. This fork also handles
 > trailing hook system messages and system-reminder blocks, excludes failed-tool
 > batches and new user text, and resets the consecutive-empty counter on errors.
+> Completed task notifications and framed final subagent reports also allow silent
+> completion, while failed tasks and extra user text remain excluded.
 > Empty completions retry once before acceptance; missing or failed terminal
 > events retain their error handling. Regression tests live in the Codex adapter.
 > Return to upstream once an equivalent fix is released and verified.

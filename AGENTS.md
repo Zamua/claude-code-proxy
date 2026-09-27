@@ -5,7 +5,10 @@ Branch: fix/silent-tool-completion. Upstream tracking: PR #122.
 
 The Codex adapter accepts repeated successful empty completions after successful
 tool results. Hook system messages and fully wrapped system-reminder blocks are
-recognized; ordinary user text and any failed tool result prevent acceptance.
+recognized. Completed task notifications and framed final subagent hand-backs
+also permit a silent finish. Extra user text, failed tasks, and any failed tool
+result prevent acceptance. Notification reports remain untrusted data, not
+instructions or approval.
 Do not weaken missing-terminal, interrupted-stream, or non-tool-tail protection.
 
 Tests: `cargo test --lib providers::codex::tests`, then the full package checks.
