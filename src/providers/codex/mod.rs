@@ -777,6 +777,7 @@ async fn live_stream_response(
                 return map_codex_error_to_response(&err);
             }
             Err(err) if retryable_live_start_codex_error(&err) => {
+                empty_completion_attempts = 0;
                 let dropped = drop_live_continuation_for_retry(&mut continuation);
                 if dropped && is_missing_previous_response_error(&err) {
                     attempt += 1;
@@ -831,6 +832,8 @@ async fn live_stream_response(
                 }
                 if error.detail.as_deref() == Some(EMPTY_CODEX_COMPLETION_DETAIL) {
                     empty_completion_attempts += 1;
+                } else {
+                    empty_completion_attempts = 0;
                 }
                 let dropped = drop_live_continuation_for_retry(&mut continuation);
                 if full_context_retry_attempted && client::is_continuation_retry_error(&error) {
@@ -1022,16 +1025,17 @@ async fn live_stream_response_once(
     )
 }
 
-/// True when the ORIGINAL Anthropic request ends with a SUCCESSFUL tool_result: last
-/// message is role=user and its last content block is a `tool_result` without
-/// `is_error: true`. After such a tail an empty successful completion is frequently the
-/// turn's legitimate end — the model delivered its answer through the tool call (a
-/// messaging/reply tool) and has nothing to add. Checked on the pre-translation body
-/// because the translated `function_call_output` no longer distinguishes error results.
-/// An `is_error` tail is deliberately excluded: an error result demands a model reaction,
-/// so a deterministic empty there stays a loud failure.
+/// Inspect the original request so failed tool results remain distinguishable.
+/// Claude may append system-role hook output or system-reminder text after a
+/// tool result. Skip that framing, but never skip ordinary user text or accept
+/// a batch containing a failed tool result.
 fn tail_is_successful_tool_result(body: &MessagesRequest) -> bool {
-    let Some(last) = body.messages.last() else {
+    let Some(last) = body
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role != "system")
+    else {
         return false;
     };
     if last.role != "user" {
@@ -1040,14 +1044,37 @@ fn tail_is_successful_tool_result(body: &MessagesRequest) -> bool {
     let Some(blocks) = last.content.as_array() else {
         return false;
     };
-    let Some(block) = blocks.last() else {
+    let mut found_tool_result = false;
+    for block in blocks {
+        match block.get("type").and_then(|value| value.as_str()) {
+            Some("tool_result")
+                if block.get("is_error").and_then(|v| v.as_bool()) != Some(true) =>
+            {
+                found_tool_result = true;
+            }
+            Some("text")
+                if block
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(is_system_reminder) => {}
+            _ => return false,
+        }
+    }
+    found_tool_result
+}
+
+fn is_system_reminder(text: &str) -> bool {
+    let mut remaining = text.trim();
+    if remaining.is_empty() {
         return false;
-    };
-    block.get("type").and_then(|v| v.as_str()) == Some("tool_result")
-        && !block
-            .get("is_error")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
+    }
+    while let Some(body) = remaining.strip_prefix("<system-reminder>") {
+        let Some((_, tail)) = body.split_once("</system-reminder>") else {
+            return false;
+        };
+        remaining = tail.trim();
+    }
+    remaining.is_empty()
 }
 
 /// The shared disposition for an empty successful completion, used by BOTH transports.
@@ -1935,6 +1962,57 @@ mod tests {
     }
 
     #[test]
+    fn successful_tool_result_tail_with_hook_reminders_is_detected() {
+        for messages in [
+            serde_json::json!([
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"t1","content":"sent"},
+                    {"type":"text","text":"<system-reminder>Keep the final response concise.</system-reminder>"}
+                ]}
+            ]),
+            serde_json::json!([
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"sent"}]},
+                {"role":"system","content":"PostToolUse hook completed."}
+            ]),
+        ] {
+            assert!(tail_is_successful_tool_result(&request_with_tail(messages)));
+        }
+    }
+
+    #[test]
+    fn tool_result_tail_does_not_hide_errors_or_new_user_input() {
+        for messages in [
+            serde_json::json!([
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"t1","content":"failed","is_error":true},
+                    {"type":"text","text":"<system-reminder>Keep responses concise.</system-reminder>"}
+                ]},
+                {"role":"system","content":"PostToolUse hook completed."}
+            ]),
+            serde_json::json!([
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"sent"}]},
+                {"role":"user","content":"Now answer another question."}
+            ]),
+            serde_json::json!([
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"t1","content":"sent"},
+                    {"type":"text","text":"<system-reminder>Be concise.</system-reminder> Now answer another question."}
+                ]}
+            ]),
+            serde_json::json!([
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"t1","content":"failed","is_error":true},
+                    {"type":"tool_result","tool_use_id":"t2","content":"sent"}
+                ]}
+            ]),
+        ] {
+            assert!(!tail_is_successful_tool_result(&request_with_tail(
+                messages
+            )));
+        }
+    }
+
+    #[test]
     fn error_tool_result_tail_is_excluded() {
         let body = request_with_tail(serde_json::json!([
             {"role":"user","content":"ping"},
@@ -1971,11 +2049,23 @@ mod tests {
     #[test]
     fn empty_completion_is_accepted_only_after_one_retry_and_only_with_the_tail() {
         // The discriminator: a glitch clears on one resend, a semantic empty repeats.
-        assert!(!accept_empty_completion(true, 0), "first empty must retry once");
-        assert!(accept_empty_completion(true, 1), "second consecutive empty is the turn's end");
+        assert!(
+            !accept_empty_completion(true, 0),
+            "first empty must retry once"
+        );
+        assert!(
+            accept_empty_completion(true, 1),
+            "second consecutive empty is the turn's end"
+        );
         assert!(accept_empty_completion(true, 2));
-        assert!(!accept_empty_completion(false, 0), "no tool tail: unchanged #70/#71 behavior");
-        assert!(!accept_empty_completion(false, 5), "no tool tail: never accepted");
+        assert!(
+            !accept_empty_completion(false, 0),
+            "no tool tail: unchanged #70/#71 behavior"
+        );
+        assert!(
+            !accept_empty_completion(false, 5),
+            "no tool tail: never accepted"
+        );
     }
 
     fn empty_terminal_fixture() -> (
@@ -2070,7 +2160,9 @@ mod tests {
         {
             LiveStreamStart::Response(response) => response,
             LiveStreamStart::Retry { error, .. } => {
-                panic!("accept flag set: the empty completion must be delivered, got retry: {error}")
+                panic!(
+                    "accept flag set: the empty completion must be delivered, got retry: {error}"
+                )
             }
         };
         let mut collected = Vec::new();
