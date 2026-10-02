@@ -1,3 +1,14 @@
+> **Temporary fork:** Based on v0.1.43 with [upstream PR #122](https://github.com/raine/claude-code-proxy/pull/122)
+> for successful silent completion after tool results. This fork also handles
+> trailing hook system messages and system-reminder blocks, excludes failed-tool
+> batches and new user text, and resets the consecutive-empty counter on errors.
+> Completed task notifications and framed final subagent reports also allow silent
+> completion, including an adjacent harness interruption marker. Failed tasks,
+> interruption markers alone, and extra user text remain excluded.
+> Empty completions retry once before acceptance; missing or failed terminal
+> events retain their error handling. Regression tests live in the Codex adapter.
+> Return to upstream once an equivalent fix is released and verified.
+
 # claude-code-proxy
 
 Claude Code, powered by **OpenAI Codex**, **Kimi**, **Grok**, **OpenCode Go**,
